@@ -234,6 +234,25 @@ export function stuck(history) {
   return waits >= WAIT_LIMIT || (last.length === 3 && last.every(h => h.page_changed === false));
 }
 
+export const BLOCKED_SURE = 0.7, BLOCKED_PATIENCE_MS = 5000;
+
+/**
+ * What to do with a BLOCKED answer: "end" the run, "wait" and look again, or "ask" Jev again.
+ * A fallback for when Jev answers BLOCKED where page.busy should have made it WAIT.
+ *
+ * An unsure BLOCKED (p < BLOCKED_SURE) is often a page caught before it finished: not rendered
+ * yet at the start of a run (no history), or mid-submit right after an action. Only those wait.
+ * A confident BLOCKED, or one after a missed action (nothing ran, so nothing is in flight), ends
+ * the run. Jev is stateless, so the same page gets the same answer: ask again only once the page
+ * changed from the one Jev answered on, and end if it has not within BLOCKED_PATIENCE_MS.
+ * `waited` counts from the first BLOCKED since the last action, so the budget covers every round.
+ */
+export function onBlocked({ p, history, changed, waited }) {
+  if (p >= BLOCKED_SURE || history.at(-1)?.missed) return "end";
+  if (changed) return "ask";
+  return waited < BLOCKED_PATIENCE_MS ? "wait" : "end";
+}
+
 /** Reject anything outside the offered set. Nothing executes on an invalid answer. */
 export function pick(answer, offered) {
   if (!answer || !(answer.choice in offered)) throw new Error("Jev answered outside the offered choices; nothing executed.");

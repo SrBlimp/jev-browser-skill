@@ -6,7 +6,8 @@ description: Drive a real browser with Jev, TypeSafe's ~100ms decision model. Gi
 # Jev Browser
 
 `scripts/jev.mjs` opens Chrome, observes the page, and asks Jev (TypeSafe's single-forward-pass
-model) to choose the next operation and target. It loops until Jev answers `DONE` or `BLOCKED`.
+model) to choose the next operation and target. It loops until Jev answers `DONE` or `BLOCKED`
+(an unsure `BLOCKED` first waits up to 5s for the page to change, see below).
 You write the goal; Jev makes every navigation decision. If the user asks how it works, point
 them at README.md and `scripts/core.mjs`, which is the whole decision logic in 250 lines.
 
@@ -59,6 +60,10 @@ Each step prints one line: operation, target, Jev's probability, Jev latency, el
 
 A `skipped:` line under a step means its target was covered or off screen, so nothing was clicked;
 Jev sees the miss and picks something else.
+
+A `BLOCKED` below p=0.70 at the start or right after an action is often a page caught mid-load or
+mid-submit. The run then waits up to 5s for the page to change: if it does, the line reads
+`BLOCKED → looking again` and Jev is asked again on the new page; if not, the run ends blocked.
 
 Then a JSON summary: `status` (`done`, `blocked`, `max_steps`), `steps`, `seconds`,
 `jev_seconds`, final `url`, `title` and visible `page_text`. Answer the user's question from

@@ -12,7 +12,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { busySigns, decide, fingerprint, markChanged, stuck } from "./core.mjs";
+import { busySigns, decide, fingerprint, markChanged, onBlocked, stuck } from "./core.mjs";
 import { Chrome, sleep } from "./browser.mjs";
 
 const API = "https://api.typesafe.ai/v1/systemone";
@@ -91,7 +91,7 @@ async function main() {
   fetch(API, { method: "HEAD" }).catch(() => {}); // open the TLS connection to Jev while the browser starts
   const chrome = await Chrome.open(args.browser, { headless: args.headless });
   const history = [], trace = { goal: args.goal, texts: args.text, secret: Boolean(args.secret), url, model, steps: [] };
-  let status = "max_steps", modelMs = 0, page, actedOn; // actedOn: the page of the last action that was not a WAIT
+  let status = "max_steps", modelMs = 0, page, actedOn, blocked = null; // actedOn: the page of the last action that was not a WAIT; blocked: when the first BLOCKED since the last action came
   const started = performance.now();
   const elapsed = () => Math.round(performance.now() - started);
 
@@ -108,17 +108,33 @@ async function main() {
       const decision = await decide(ask, { goal: args.goal, page, texts: args.text, secret: args.secret, history, model });
       modelMs += decision.ms;
       const { operation, e, option, text } = decision;
-      const shown = decision.secret ? "••••••" : text;
-      const label = e ? `${e.role} "${e.label}"` + (option ? ` → "${option.label}"` : "") + (text ? ` ← "${shown}"` : "") : "";
-      console.log(`${String(trace.steps.length + 1).padStart(2)}  ${operation.padEnd(11)} ${label.padEnd(58).slice(0, 58)}  p=${decision.p.toFixed(2)}  ${String(decision.ms).padStart(4)}ms  +${(elapsed() / 1000).toFixed(1)}s`);
+      const shown = decision.secret ? "••••••" : text, at = elapsed();
+      let label = e ? `${e.role} "${e.label}"` + (option ? ` → "${option.label}"` : "") + (text ? ` ← "${shown}"` : "") : "";
+      let again = false;
+      if (operation === "BLOCKED") { // an unsure BLOCKED may be a page caught mid-load: wait for it to change (core.mjs onBlocked)
+        if (blocked?.step !== history.length) blocked = { step: history.length, since: performance.now() };
+        const before = fingerprint(page), since = performance.now();
+        let look = page, verdict;
+        while ((verdict = onBlocked({ p: decision.p, history, changed: fingerprint(look) !== before, waited: performance.now() - blocked.since })) === "wait") {
+          await sleep(250);
+          look = await chrome.observe();
+          markChanged(history, look);
+        }
+        const waited = ((performance.now() - since) / 1000).toFixed(1);
+        again = verdict === "ask";
+        if (again) label = `→ looking again: the page changed after ${waited}s`;
+        else if (look !== page) label = `(the page did not change in ${waited}s)`;
+      }
+      console.log(`${String(trace.steps.length + 1).padStart(2)}  ${operation.padEnd(11)} ${label.padEnd(58).slice(0, 58)}  p=${decision.p.toFixed(2)}  ${String(decision.ms).padStart(4)}ms  +${(at / 1000).toFixed(1)}s`);
       if (process.env.JEV_DEBUG) {
         console.error("   ops: " + top(decision.probabilities.operation));
         if (decision.probabilities.target) console.error("   targets: " + top(decision.probabilities.target, k => `[${k}] ${page.elements[Number(k.split(":")[0]) - 1].label}`));
       }
       trace.steps.push({
-        elapsed_ms: elapsed(), page: { ...page, screenshot }, calls: decision.calls,
+        elapsed_ms: at, page: { ...page, screenshot }, calls: decision.calls,
         decision: { operation, target: e && `[${e.index}] ${e.role} "${e.label}"`, option: option?.label, text: shown, p: decision.p, probabilities: decision.probabilities, ms: decision.ms },
       });
+      if (again) { trace.steps.at(-1).executed = false; continue; } // superseded, not final: the page changed, so it is observed again
       if (operation === "DONE" || operation === "BLOCKED") { status = operation.toLowerCase(); break; }
 
       let acted = 0;
@@ -165,7 +181,7 @@ async function main() {
 
   const result = {
     status,
-    steps: history.length,
+    steps: trace.steps.filter(s => "executed" in s).length, // every trace step but the final DONE/BLOCKED
     seconds: +(elapsed() / 1000).toFixed(1),
     jev_seconds: +(modelMs / 1000).toFixed(2),
     url: page.url,

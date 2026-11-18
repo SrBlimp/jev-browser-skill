@@ -1,7 +1,7 @@
 // Pure-logic tests for the decision layer. No network, no browser, no dependencies.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildRequest, readDecision, OPERATIONS, RULES, fingerprint, busySigns, markChanged, stuck, WAIT_LIMIT } from "../scripts/core.mjs";
+import { buildRequest, readDecision, OPERATIONS, RULES, fingerprint, busySigns, markChanged, stuck, WAIT_LIMIT, onBlocked, BLOCKED_SURE, BLOCKED_PATIENCE_MS } from "../scripts/core.mjs";
 
 // A page shaped like a login form: a text field, a password field, a button, a link.
 const loginPage = () => ({
@@ -232,4 +232,19 @@ test("WAITs that never see a change are stuck after WAIT_LIMIT in a row", () => 
   const waits = n => Array.from({ length: n }, () => ({ operation: "WAIT", page_changed: false }));
   assert.ok(!stuck([{ operation: "CLICK", page_changed: true }, ...waits(WAIT_LIMIT - 1)]));
   assert.ok(stuck([{ operation: "CLICK", page_changed: true }, ...waits(WAIT_LIMIT)]));
+});
+
+test("an unsure BLOCKED waits for the page to change, then asks again", () => {
+  const acted = [{ operation: "CLICK" }], unsure = BLOCKED_SURE - 0.25;
+  assert.equal(onBlocked({ p: unsure, history: acted, changed: false, waited: 0 }), "wait");
+  assert.equal(onBlocked({ p: unsure, history: acted, changed: true, waited: 900 }), "ask");
+  assert.equal(onBlocked({ p: unsure, history: [], changed: false, waited: 0 }), "wait", "the first page may not have rendered");
+});
+
+test("BLOCKED ends the run when confident, after a miss, or once patience runs out", () => {
+  const acted = [{ operation: "CLICK" }];
+  assert.equal(onBlocked({ p: BLOCKED_SURE, history: acted, changed: false, waited: 0 }), "end");
+  assert.equal(onBlocked({ p: 0.9, history: acted, changed: true, waited: 0 }), "end", "a confident BLOCKED is final");
+  assert.equal(onBlocked({ p: 0.4, history: [{ operation: "CLICK", missed: true }], changed: false, waited: 0 }), "end", "nothing ran, so nothing is in flight");
+  assert.equal(onBlocked({ p: 0.4, history: acted, changed: false, waited: BLOCKED_PATIENCE_MS }), "end", "an unchanged page gets the same answer");
 });
