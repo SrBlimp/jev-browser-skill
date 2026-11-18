@@ -1,7 +1,7 @@
 // Pure-logic tests for the decision layer. No network, no browser, no dependencies.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildRequest, readDecision, OPERATIONS } from "../scripts/core.mjs";
+import { buildRequest, readDecision, OPERATIONS, RULES, fingerprint, busySigns, markChanged, stuck, WAIT_LIMIT } from "../scripts/core.mjs";
 
 // A page shaped like a login form: a text field, a password field, a button, a link.
 const loginPage = () => ({
@@ -171,4 +171,65 @@ test("every offered operation ships a description for Jev to choose on", () => {
     assert.ok(text.length > 10, `${op} needs a real description`);
   }
   assert.deepEqual(Object.keys(body.questions.operation.criteria), Object.keys(offered));
+});
+
+test("page.busy reaches Jev only when there is a sign; an empty list would read as finished", () => {
+  assert.ok(!("busy" in buildRequest({ ...base, page: { ...loginPage(), busy: [] } }).body.state.page));
+  const busy = { ...loginPage(), busy: ["3 requests in flight"] };
+  assert.deepEqual(buildRequest({ ...base, page: busy }).body.state.page.busy, ["3 requests in flight"]);
+  assert.ok(RULES.includes("page.busy"), "Jev is told what busy means");
+});
+
+test("busy signs: the snapshot's own, a blank page, and requests in flight", () => {
+  assert.deepEqual(busySigns(loginPage()), [], "a finished page has none");
+  assert.deepEqual(busySigns({ ...loginPage(), signs: ["document still loading", "aria-busy"] }), ["document still loading", "aria-busy"]);
+  assert.deepEqual(busySigns({ url: "https://example.com/", title: "", text: " ", elements: [] }), ["the page is blank"]);
+  assert.deepEqual(busySigns(loginPage(), { requests: 1 }), ["1 request in flight"]);
+  assert.deepEqual(busySigns(loginPage(), { requests: 7, quietMs: 50 }), ["7 requests in flight"]);
+  assert.deepEqual(busySigns(loginPage(), { quietMs: 130 }), ["a response arrived 0.1s ago and may still be rendering"], "rendering what just arrived");
+  assert.deepEqual(busySigns(loginPage(), { quietMs: 1500 }), [], "quiet for a while: finished");
+});
+
+test("a control offered before the last action and disabled now is a submit in flight", () => {
+  const before = loginPage(), now = { ...loginPage(), elements: loginPage().elements.filter(e => e.node !== 3) };
+  const spinning = { node: 3, role: "button", label: "log in progress_activity" }; // an icon font adds its text while busy
+  assert.deepEqual(busySigns({ ...now, disabled: [spinning] }, { before }), ['button "log in" is now disabled'], "same node, named as it was offered");
+  const rerendered = { node: 9, role: "button", label: "log in" };
+  assert.deepEqual(busySigns({ ...now, url: "https://example.com/next", disabled: [rerendered] }, { before }), ['button "log in" is now disabled'], "same role and label");
+  assert.deepEqual(busySigns({ ...now, url: "https://example.com/next", disabled: [spinning] }, { before }), [], "node ids restart with a new document");
+  assert.deepEqual(busySigns({ ...now, disabled: [{ node: 7, role: "button", label: "Previous" }] }, { before }), [], "disabled all along, like a first-page Previous, is no sign");
+  assert.deepEqual(busySigns({ ...now, disabled: [spinning] }), [], "nothing to compare with at the start");
+});
+
+test("a spinner going away or a button re-enabling is a page change", () => {
+  assert.notEqual(fingerprint({ ...loginPage(), signs: ["aria-busy"] }), fingerprint({ ...loginPage(), signs: [] }));
+  assert.notEqual(fingerprint({ ...loginPage(), disabled: [{ node: 3, role: "button", label: "log in" }] }), fingerprint({ ...loginPage(), disabled: [] }));
+});
+
+test("page_changed is recomputed on every look, not fixed by the first", () => {
+  const history = [{ operation: "CLICK", fingerprint: fingerprint(loginPage()) }];
+  markChanged(history, loginPage()); // looked too early: the submit has not landed yet
+  assert.equal(history[0].page_changed, false);
+  markChanged(history, { ...loginPage(), text: "Welcome" });
+  assert.equal(history[0].page_changed, true, "a later look sees the change");
+  const missed = [{ operation: "CLICK", fingerprint: fingerprint(loginPage()), page_changed: false, missed: true }];
+  markChanged(missed, { ...loginPage(), text: "Welcome" });
+  assert.equal(missed[0].page_changed, false, "a missed click ran nothing, whatever the page did");
+  assert.doesNotThrow(() => markChanged([], loginPage()), "nothing to mark before the first action");
+});
+
+test("three unchanged actions are stuck; misses and unchanged WAITs do not count", () => {
+  const click = (page_changed, extra) => ({ operation: "CLICK", page_changed, ...extra });
+  const wait = page_changed => ({ operation: "WAIT", page_changed });
+  assert.ok(stuck([click(false), click(false), click(false)]));
+  assert.ok(!stuck([click(false), click(false), click(false, { missed: true })]), "a skipped click is not the page ignoring us");
+  assert.ok(!stuck([click(true), wait(false), wait(false), wait(false)]), "a slow submit: the click worked, the WAITs are patience");
+  assert.ok(!stuck([click(false), wait(true), click(false), click(false)]), "a WAIT that saw the page change breaks the run");
+  assert.ok(stuck([click(false), wait(false), click(false), click(false)]));
+});
+
+test("WAITs that never see a change are stuck after WAIT_LIMIT in a row", () => {
+  const waits = n => Array.from({ length: n }, () => ({ operation: "WAIT", page_changed: false }));
+  assert.ok(!stuck([{ operation: "CLICK", page_changed: true }, ...waits(WAIT_LIMIT - 1)]));
+  assert.ok(stuck([{ operation: "CLICK", page_changed: true }, ...waits(WAIT_LIMIT)]));
 });

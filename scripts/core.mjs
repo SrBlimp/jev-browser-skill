@@ -20,7 +20,9 @@ take another route: menus, tabs, lists and links can reach the same page.
 DONE requires visible evidence that every requirement of the goal is satisfied.
 BLOCKED means no offered operation can make progress.
 WAIT when the page is blank, still loading or mid-transition, so acting now would be on a page
-that is not there yet. A page that is complete but unhelpful is not a reason to WAIT.`;
+that is not there yet. A page that is complete but unhelpful is not a reason to WAIT.
+page.busy, when present, lists signs the page is still loading or submitting: WAIT, unless the
+control the goal needs next is already on the page.`;
 
 const TARGET_RULES = `Choose the best target assuming the next operation is the one named here.
 Another question decides the operation. Do not pick a field that already holds the requested value.`;
@@ -89,12 +91,16 @@ const SNAPSHOT = `(() => {
   };
   const selector = 'a[href],button,input,textarea,select,summary,[contenteditable="true"],' +
     roles.map(r => '[role="' + r + '"]').join(',');
-  const elements = []; let omitted = 0;
+  const elements = [], disabled = []; let omitted = 0;
   for (const e of document.querySelectorAll(selector)) {
     if (elements.length >= 250) { omitted++; continue; } // Jev accepts at most 255 choices per question
     if (['file', 'hidden'].includes(e.type)) continue;
-    if (!visible(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) continue;
+    if (!visible(e)) continue;
     const r = e.getBoundingClientRect(), kind = role(e);
+    if (e.matches(':disabled') || e.closest('[aria-disabled="true"]')) { // not offered, but noted: see busySigns
+      if (kind && disabled.length < 20) disabled.push({ node: identity(e), role: kind, label: name(e) || kind });
+      continue;
+    }
     if (!kind || !r.width || !r.height) continue;
     if (r.bottom + scrollY <= 0 || r.right + scrollX <= 0) continue; // placed off the page, like a skip link
     const cx = r.x + r.width / 2, cy = r.y + r.height / 2;
@@ -125,6 +131,11 @@ const SNAPSHOT = `(() => {
     }
     elements.push(item);
   }
+  // Signs, seen from inside the page, that it is still working (more are added in busySigns).
+  const signs = [];
+  if (document.readyState !== 'complete') signs.push('document still loading');
+  if ([...document.querySelectorAll('[aria-busy="true"]')].some(visible)) signs.push('aria-busy');
+  if ([...document.querySelectorAll('[role="progressbar"],progress')].some(visible)) signs.push('progress bar visible');
   const words = [], walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   const range = document.createRange(); let node, length = 0;
   while ((node = walker.nextNode()) && length < 5000) {
@@ -133,7 +144,7 @@ const SNAPSHOT = `(() => {
     range.selectNodeContents(node); const r = range.getBoundingClientRect();
     if (r.width && r.height) { words.push(value); length += value.length; }
   }
-  return { url: location.href, title: document.title, text: words.join('\\n').slice(0, 5000), elements, omitted,
+  return { url: location.href, title: document.title, text: words.join('\\n').slice(0, 5000), elements, omitted, signs, disabled,
     viewport: { w: innerWidth, h: innerHeight, x: scrollX, y: scrollY } };
 })()`;
 
@@ -173,8 +184,55 @@ const LOCATE = `((id, note, coordinates = true) => {
 
 export { SNAPSHOT, LOCATE };
 
-/** What a page looks like for change detection: the same fingerprint means nothing happened. */
-export const fingerprint = page => JSON.stringify([page.url, page.text, page.elements.map(e => [e.node, e.value, e.checked, e.expanded])]);
+/** What a page looks like for change detection: the same fingerprint means nothing happened. A spinner going away counts. */
+export const fingerprint = page => JSON.stringify([page.url, page.text, page.elements.map(e => [e.node, e.value, e.checked, e.expanded]), page.signs, page.disabled?.map(d => d.node)]);
+
+/**
+ * page.busy: short facts that say the page is not finished, for Jev to choose WAIT on. The
+ * snapshot's own signs, plus two it cannot know alone: a blank page, and a control offered before
+ * the last action that is now disabled (a submit in flight; the table leaves disabled controls
+ * out, so the button just vanishes). A control matches by node id on the same URL, since its name
+ * can change while busy (a spinner icon adds its text), or by role and label after a re-render.
+ * `requests` counts the page and data requests still loading, `quietMs` is the time since the
+ * last one finished; within a second of that, an app is often still rendering what it got.
+ */
+export function busySigns(page, { before, requests = 0, quietMs = Infinity } = {}) {
+  const signs = [...(page.signs ?? [])];
+  if (!page.text.trim() && !page.elements.length) signs.push("the page is blank");
+  const disabled = page.disabled ?? [], sameUrl = before?.url.split("#")[0] === page.url.split("#")[0];
+  for (const e of before?.elements ?? [])
+    if (disabled.some(d => (sameUrl && d.node === e.node) || (d.role === e.role && d.label === e.label))) signs.push(`${e.role} "${e.label}" is now disabled`);
+  if (requests) signs.push(`${requests} request${requests > 1 ? "s" : ""} in flight`);
+  // worded as what it means: a bare "last request finished 0.0s ago" moved Jev less than this
+  else if (quietMs < 1000) signs.push(`a response arrived ${(quietMs / 1000).toFixed(1)}s ago and may still be rendering`);
+  return signs;
+}
+
+/**
+ * Record whether the last action changed the page, on every look and not only the first: a look
+ * taken mid-submit sees no change yet, and a stale `false` tells Jev its click did nothing and
+ * counts toward the stuck check. A missed action ran nothing, so it stays `false`.
+ */
+export function markChanged(history, page) {
+  const last = history.at(-1);
+  if (last && !last.missed) last.page_changed = last.fingerprint !== fingerprint(page);
+}
+
+export const WAIT_LIMIT = 6;
+
+/**
+ * Whether the run is stuck: the last three actions all left the page unchanged. A missed action
+ * ran nothing and a WAIT that saw no change is just patience (a slow submit), so neither counts;
+ * instead WAIT_LIMIT unchanged WAITs in a row (about 8s with the loop's backoff) are stuck too.
+ */
+export function stuck(history) {
+  const unchangedWait = h => h.operation === "WAIT" && h.page_changed === false;
+  const acts = history.filter(h => !h.missed);
+  let waits = 0;
+  while (waits < acts.length && unchangedWait(acts.at(-1 - waits))) waits++;
+  const last = acts.filter(h => !unchangedWait(h)).slice(-3);
+  return waits >= WAIT_LIMIT || (last.length === 3 && last.every(h => h.page_changed === false));
+}
 
 /** Reject anything outside the offered set. Nothing executes on an invalid answer. */
 export function pick(answer, offered) {
@@ -240,7 +298,8 @@ export function buildRequest({ goal, page, texts = [], secret = "", history = []
     };
   }
   const state = {
-    page: { url: page.url, title: page.title, text: page.text },
+    // busy is left out when empty: an explicit empty list reads as "finished", even on a blank page
+    page: { url: page.url, title: page.title, text: page.text, ...(page.busy?.length ? { busy: page.busy } : {}) },
     elements: page.elements.map(({ node, op, options, rect, search, href, ...rest }) => // node ids and geometry stay with the code
       ({ ...rest, operation: op === "SECRET" ? "TYPE" : op, ...(options ? { options: options.map(o => o.label) } : {}) })),
     text_values: texts,

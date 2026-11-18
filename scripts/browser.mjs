@@ -11,6 +11,7 @@ import { SNAPSHOT, LOCATE, fingerprint } from "./core.mjs";
 
 export const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+const TRACKED = new Set(["Document", "Script", "XHR", "Fetch"]); // see network()
 const HOME = homedir();
 const LOCAL = process.env.LOCALAPPDATA || join(HOME, "AppData", "Local");
 const OWN_PROFILE = process.env.JEV_PROFILE || join(HOME, ".jev-browser", "chrome");
@@ -126,6 +127,8 @@ class Chrome {
     this.headless = headless;
     this.pending = new Map();
     this.nextId = 1;
+    this.requests = new Map(); // requestId → when it started, for the loads network() counts
+    this.loaded = -Infinity;   // when the last of them finished
   }
 
   async connect(endpoint, { newTab = false } = {}) {
@@ -144,6 +147,8 @@ class Chrome {
         if (message.params.frameId === this.targetId) this.navigationStarted = performance.now();
       } else if (message.method === "Page.frameNavigated" ? !message.params.frame.parentId
         : message.method === "Page.frameStoppedLoading" && message.params.frameId === this.targetId) this.navigationEnded = performance.now();
+      else if (message.method === "Network.requestWillBeSent" && TRACKED.has(message.params.type)) this.requests.set(message.params.requestId, performance.now());
+      else if ((message.method === "Network.loadingFinished" || message.method === "Network.loadingFailed") && this.requests.delete(message.params.requestId)) this.loaded = performance.now();
       const waiter = this.pending.get(message.id);
       if (!waiter) return;
       this.pending.delete(message.id);
@@ -157,6 +162,7 @@ class Chrome {
     this.targetId = page.targetId;
     this.session = (await this.send("Target.attachToTarget", { targetId: page.targetId, flatten: true }, null)).sessionId;
     await this.send("Page.enable");
+    await this.send("Network.enable"); // for network()
     await this.send("Emulation.setFocusEmulationEnabled", { enabled: true }); // keep rendering if the tab is not in front
   }
 
@@ -246,6 +252,19 @@ class Chrome {
     }
     if (previous) return done(previous, "still changing");
     throw new Error("Page did not become readable");
+  }
+
+  /**
+   * Page and data requests still loading: the document, scripts, XHR and fetch, which is what an
+   * app waits on before it renders or answers a submit. Images, fonts, styles and pings are not
+   * counted (they never hold up a control), nor WebSocket or EventSource streams; anything older
+   * than 10s is a long poll, not loading, and is dropped so it cannot pin the page as busy.
+   * `quietMs` is how long ago the last one finished: an app often renders a beat after its last
+   * response, with nothing in flight, and observe() can settle in that gap.
+   */
+  network() {
+    for (const [id, since] of this.requests) if (performance.now() - since > 10000) this.requests.delete(id);
+    return { requests: this.requests.size, quietMs: performance.now() - this.loaded };
   }
 
   async locate(node, note, coordinates = true) {

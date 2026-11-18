@@ -12,7 +12,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { decide, fingerprint } from "./core.mjs";
+import { busySigns, decide, fingerprint, markChanged, stuck } from "./core.mjs";
 import { Chrome, sleep } from "./browser.mjs";
 
 const API = "https://api.typesafe.ai/v1/systemone";
@@ -91,7 +91,7 @@ async function main() {
   fetch(API, { method: "HEAD" }).catch(() => {}); // open the TLS connection to Jev while the browser starts
   const chrome = await Chrome.open(args.browser, { headless: args.headless });
   const history = [], trace = { goal: args.goal, texts: args.text, secret: Boolean(args.secret), url, model, steps: [] };
-  let status = "max_steps", modelMs = 0, page;
+  let status = "max_steps", modelMs = 0, page, actedOn; // actedOn: the page of the last action that was not a WAIT
   const started = performance.now();
   const elapsed = () => Math.round(performance.now() - started);
 
@@ -99,9 +99,9 @@ async function main() {
     await chrome.goto(url);
     while (history.length < maxSteps) {
       page = await chrome.observe();
-      if (history.length) history.at(-1).page_changed ??= history.at(-1).fingerprint !== fingerprint(page);
-      const stuck = history.filter(h => !h.missed).slice(-3); // a skipped click is not the page ignoring us
-      if (stuck.length === 3 && stuck.every(h => h.page_changed === false)) { status = "blocked"; break; }
+      page.busy = busySigns(page, { before: actedOn, ...chrome.network() });
+      markChanged(history, page);
+      if (stuck(history)) { status = "blocked"; break; }
       if (page.omitted) console.error(`   warning: ${page.omitted} controls beyond the first 250 were not offered to Jev (255-choice limit per question)`);
 
       const screenshot = args.trace ? await chrome.screenshot() : null;
@@ -145,10 +145,14 @@ async function main() {
         else await chrome.click(point);
         if (operation === "TYPE") await chrome.type(e.node, text);
       } else if (operation === "ENTER") { acted = performance.now(); await chrome.enter(); }
-      else await sleep(250); // WAIT: give the page a moment, then observe again
+      else { // WAIT: give the page a moment, longer each time in a row (0.25s up to 2s), then observe again
+        const waits = history.length - 1 - history.findLastIndex(h => h.operation !== "WAIT");
+        await sleep(250 * 2 ** Math.min(waits, 3));
+      }
       trace.steps.at(-1).executed = true;
 
       history.push({ operation, target: e && `${e.role} "${e.label}"`, text: shown, url: page.url, href: e?.href, fingerprint: fingerprint(page) });
+      if (operation !== "WAIT") actedOn = page; // a WAIT keeps the comparison with the page the submit was clicked on
       if (acted) await chrome.react(page, acted, e?.href);
       await chrome.settle();
     }
