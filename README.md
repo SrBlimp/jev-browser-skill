@@ -152,7 +152,7 @@ node ~/.claude/skills/jev-browser/scripts/jev.mjs \
 | `--url` | Where to start |
 | `--goal` | The whole task in a sentence or two, including what "done" looks like. Repeat for a sequence: when Jev answers DONE, the next goal starts on the same page with a fresh history |
 | `--text` | A string Jev may type. Repeat for several values |
-| `--secret` | A string typed only into password fields, never sent to Jev or printed |
+| `--secret` | A string typed only into password fields, never sent to Jev or printed. `JEV_SECRET` in the environment does the same and keeps it out of the process list |
 | `--trace run.json` | Save every step: element table, request, answers, decision, screenshot. Drop it on the [site](https://jev-browser.rovira.sh) to step through it |
 | `--screenshot out.png` | Save the final page |
 | `--browser` | `auto` (default), `yours`, `own`, or `host:port` |

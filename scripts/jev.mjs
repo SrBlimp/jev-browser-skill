@@ -75,6 +75,7 @@ async function main() {
 
   --text <value>       A string Jev may type into a field. Repeat for several values.
   --secret <value>     A string typed only into password fields. Never sent to Jev, never printed.
+                       JEV_SECRET in the environment does the same without showing it in the process list.
   --max-steps <n>      Stop after n actions per goal (default 100).
   --screenshot <png>   Save a screenshot of the final page.
   --trace <json>       Save every step: page table, request, answers, decision, screenshot.
@@ -94,7 +95,8 @@ async function main() {
   fetch(API, { method: "HEAD" }).catch(() => {}); // open the TLS connection to Jev while the browser starts
   const chrome = await Chrome.open(args.browser, { headless: args.headless });
   const goals = args.goal, many = goals.length > 1, results = []; // results: { goal, status, steps } per goal reached
-  const history = [], trace = { goal: goals.join(" → "), ...(many ? { goals } : {}), texts: args.text, secret: Boolean(args.secret), url, model, steps: [] };
+  const secret = args.secret ?? process.env.JEV_SECRET;
+  const history = [], trace = { goal: goals.join(" → "), ...(many ? { goals } : {}), texts: args.text, secret: Boolean(secret), url, model, steps: [] };
   // g: the goal being worked on; from: its first action in history; view: the first entry Jev sees,
   // which keeps a TYPE that ended the last goal so that ENTER is still offered after it
   let status = "max_steps", modelMs = 0, page, g = 0, from = 0, view = 0, lastClick = {}; // lastClick: the last CLICK, unless another action followed, and its page
@@ -114,7 +116,7 @@ async function main() {
       if (page.omitted) console.error(`   warning: ${page.omitted} controls beyond the first 250 were not offered to Jev (255-choice limit per question)`);
 
       const screenshot = args.trace ? await chrome.screenshot() : null;
-      const decision = await decide(ask, { goal: goals[g], page, texts: args.text, secret: args.secret, history: recent, model });
+      const decision = await decide(ask, { goal: goals[g], page, texts: args.text, secret, history: recent, model });
       modelMs += decision.ms;
       const { operation, e, option, text } = decision;
       const shown = decision.secret ? "••••••" : text;
